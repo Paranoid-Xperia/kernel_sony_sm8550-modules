@@ -36,6 +36,10 @@
 #include "dp_sawf.h"
 #endif
 #include <qdf_pkt_add_timestamp.h>
+#include "dp_ipa.h"
+#ifdef IPA_OFFLOAD
+#include <wlan_ipa_obj_mgmt_api.h>
+#endif
 
 #define DP_INVALID_VDEV_ID 0xFF
 
@@ -511,7 +515,6 @@ bool dp_tx_multipass_process(struct dp_soc *soc, struct dp_vdev *vdev,
 			     struct dp_tx_msdu_info_s *msdu_info);
 
 void dp_tx_vdev_multipass_deinit(struct dp_vdev *vdev);
-void dp_tx_remove_vlan_tag(struct dp_vdev *vdev, qdf_nbuf_t nbuf);
 void dp_tx_add_groupkey_metadata(struct dp_vdev *vdev,
 				 struct dp_tx_msdu_info_s *msdu_info,
 				 uint16_t group_key);
@@ -589,7 +592,8 @@ static inline void dp_tx_get_queue(struct dp_vdev *vdev,
 {
 	/* get flow id */
 	queue->desc_pool_id = DP_TX_GET_DESC_POOL_ID(vdev);
-	if (vdev->pdev->soc->wlan_cfg_ctx->ipa_enabled)
+	if (vdev->pdev->soc->wlan_cfg_ctx->ipa_enabled &&
+	    !ipa_config_is_opt_wifi_dp_enabled())
 		queue->ring_id = DP_TX_GET_RING_ID(vdev);
 	else
 		queue->ring_id = (qdf_nbuf_get_queue_mapping(nbuf) %

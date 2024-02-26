@@ -83,10 +83,12 @@ static struct kgsl_iommu_pt *to_iommu_pt(struct kgsl_pagetable *pagetable)
 
 static u32 get_llcc_flags(struct kgsl_mmu *mmu)
 {
-	if (mmu->subtype == KGSL_IOMMU_SMMU_V500)
-		return IOMMU_USE_LLC_NWA;
-	else
-		return IOMMU_USE_UPSTREAM_HINT;
+	/* Return no-write-allocate if mmu feature for no-write-allocate is set */
+	if (test_bit(KGSL_MMU_FORCE_LLCC_NWA, &mmu->features))
+		return IOMMU_SYS_CACHE_NWA;
+
+	/* Return write allocate as default llcc allocation policy */
+	return IOMMU_SYS_CACHE;
 }
 
 static int _iommu_get_protection_flags(struct kgsl_mmu *mmu,
@@ -1289,7 +1291,7 @@ static void _enable_gpuhtw_llc(struct kgsl_mmu *mmu, struct iommu_domain *domain
 		iommu_set_pgtable_quirks(domain, IO_PGTABLE_QUIRK_ARM_OUTER_WBWA);
 }
 
-static int set_smmu_aperture(struct kgsl_device *device,
+int kgsl_set_smmu_aperture(struct kgsl_device *device,
 		struct kgsl_iommu_context *context)
 {
 	int ret;
@@ -1302,7 +1304,7 @@ static int set_smmu_aperture(struct kgsl_device *device,
 		ret = qcom_scm_kgsl_set_smmu_aperture(context->cb_num);
 
 	if (ret)
-		dev_err(device->dev, "Unable to set the SMMU aperture: %d. The aperture needs to be set to use per-process pagetables\n",
+		dev_err(&device->pdev->dev, "Unable to set the SMMU aperture: %d. The aperture needs to be set to use per-process pagetables\n",
 			ret);
 
 	return ret;
@@ -1321,7 +1323,7 @@ static int set_smmu_lpac_aperture(struct kgsl_device *device,
 		ret = qcom_scm_kgsl_set_smmu_lpac_aperture(context->cb_num);
 
 	if (ret)
-		dev_err(device->dev, "Unable to set the LPAC SMMU aperture: %d. The aperture needs to be set to use per-process pagetables\n",
+		dev_err(&device->pdev->dev, "Unable to set the LPAC SMMU aperture: %d. The aperture needs to be set to use per-process pagetables\n",
 			ret);
 
 	return ret;
@@ -1478,6 +1480,17 @@ static struct kgsl_pagetable *kgsl_iopgtbl_pagetable(struct kgsl_mmu *mmu, u32 n
 		pt->base.svm_end = KGSL_IOMMU_SVM_END32(mmu);
 	}
 
+	/*
+	 * We expect the 64-bit SVM and non-SVM ranges not to overlap so that
+	 * va_hint points to VA space at the top of the 64-bit non-SVM range.
+	 */
+	BUILD_BUG_ON_MSG(!((KGSL_IOMMU_VA_BASE64 >= KGSL_IOMMU_SVM_END64) ||
+			(KGSL_IOMMU_SVM_BASE64 >= KGSL_IOMMU_VA_END64)),
+			"64-bit SVM and non-SVM ranges should not overlap");
+
+	/* Set up the hint for 64-bit non-SVM VA on per-process pagetables */
+	pt->base.va_hint = pt->base.va_start;
+
 	ret = kgsl_iopgtbl_alloc(&iommu->user_context, pt);
 	if (ret) {
 		kfree(pt);
@@ -1562,9 +1575,6 @@ static void kgsl_iommu_close(struct kgsl_mmu *mmu)
 		__free_page(kgsl_guard_page);
 		kgsl_guard_page = NULL;
 	}
-
-	of_platform_depopulate(&iommu->pdev->dev);
-	platform_device_put(iommu->pdev);
 
 	kmem_cache_destroy(addr_entry_cache);
 	addr_entry_cache = NULL;
@@ -1871,6 +1881,21 @@ static int _remove_gpuaddr(struct kgsl_pagetable *pagetable,
 	if (WARN(!entry, "GPU address %llx doesn't exist\n", gpuaddr))
 		return -ENOMEM;
 
+	/*
+	 * If the hint was based on this entry, adjust it to the end of the
+	 * previous entry.
+	 */
+	if (pagetable->va_hint == (entry->base + entry->size)) {
+		struct kgsl_iommu_addr_entry *prev =
+			rb_entry_safe(rb_prev(&entry->node),
+				struct kgsl_iommu_addr_entry, node);
+
+		pagetable->va_hint = pagetable->va_start;
+		if (prev)
+			pagetable->va_hint = max_t(u64, prev->base + prev->size,
+							pagetable->va_start);
+	}
+
 	rb_erase(&entry->node, &pagetable->rbtree);
 	kmem_cache_free(addr_entry_cache, entry);
 	return 0;
@@ -1915,13 +1940,49 @@ static int _insert_gpuaddr(struct kgsl_pagetable *pagetable,
 	return 0;
 }
 
+static u64 _get_unmapped_area_hint(struct kgsl_pagetable *pagetable,
+		u64 bottom, u64 top, u64 size, u64 align)
+{
+	u64 hint;
+
+	/*
+	 * VA fragmentation can be a problem on global and secure pagetables
+	 * that are common to all processes, or if we're constrained to a 32-bit
+	 * range. Don't use the va_hint in these cases.
+	 */
+	if (!pagetable->va_hint || !upper_32_bits(top))
+		return (u64) -EINVAL;
+
+	/* Satisfy requested alignment */
+	hint = ALIGN(pagetable->va_hint, align);
+
+	/*
+	 * The va_hint is the highest VA that was allocated in the non-SVM
+	 * region. The 64-bit SVM and non-SVM regions do not overlap. So, we
+	 * know there is no VA allocated at this gpuaddr. Therefore, we only
+	 * need to check whether we have enough space for this allocation.
+	 */
+	if ((hint + size) > top)
+		return (u64) -ENOMEM;
+
+	pagetable->va_hint = hint + size;
+	return hint;
+}
+
 static uint64_t _get_unmapped_area(struct kgsl_pagetable *pagetable,
 		uint64_t bottom, uint64_t top, uint64_t size,
 		uint64_t align)
 {
-	struct rb_node *node = rb_first(&pagetable->rbtree);
+	struct rb_node *node;
 	uint64_t start;
 
+	/* Check if we can assign a gpuaddr based on the last allocation */
+	start = _get_unmapped_area_hint(pagetable, bottom, top, size, align);
+	if (!IS_ERR_VALUE(start))
+		return start;
+
+	/* Fall back to searching through the range. */
+	node = rb_first(&pagetable->rbtree);
 	bottom = ALIGN(bottom, align);
 	start = bottom;
 
@@ -2058,14 +2119,20 @@ static uint64_t kgsl_iommu_find_svm_region(struct kgsl_pagetable *pagetable,
 static bool iommu_addr_in_svm_ranges(struct kgsl_pagetable *pagetable,
 	u64 gpuaddr, u64 size)
 {
+	u64 end = gpuaddr + size;
+
+	/* Make sure size is not zero and we don't wrap around */
+	if (end <= gpuaddr)
+		return false;
+
 	if ((gpuaddr >= pagetable->compat_va_start && gpuaddr < pagetable->compat_va_end) &&
-		((gpuaddr + size) > pagetable->compat_va_start &&
-			(gpuaddr + size) <= pagetable->compat_va_end))
+		(end > pagetable->compat_va_start &&
+			end <= pagetable->compat_va_end))
 		return true;
 
 	if ((gpuaddr >= pagetable->svm_start && gpuaddr < pagetable->svm_end) &&
-		((gpuaddr + size) > pagetable->svm_start &&
-			(gpuaddr + size) <= pagetable->svm_end))
+		(end > pagetable->svm_start &&
+			end <= pagetable->svm_end))
 		return true;
 
 	return false;
@@ -2106,13 +2173,36 @@ out:
 	return ret;
 }
 
+static int get_gpuaddr(struct kgsl_pagetable *pagetable,
+		struct kgsl_memdesc *memdesc, u64 start, u64 end,
+		u64 size, u64 align)
+{
+	u64 addr;
+	int ret;
+
+	spin_lock(&pagetable->lock);
+	addr = _get_unmapped_area(pagetable, start, end, size, align);
+	if (addr == (u64) -ENOMEM) {
+		spin_unlock(&pagetable->lock);
+		return -ENOMEM;
+	}
+
+	ret = _insert_gpuaddr(pagetable, addr, size);
+	spin_unlock(&pagetable->lock);
+
+	if (ret == 0) {
+		memdesc->gpuaddr = addr;
+		memdesc->pagetable = pagetable;
+	}
+
+	return ret;
+}
 
 static int kgsl_iommu_get_gpuaddr(struct kgsl_pagetable *pagetable,
 		struct kgsl_memdesc *memdesc)
 {
 	int ret = 0;
-	uint64_t addr, start, end, size;
-	unsigned int align;
+	u64 start, end, size, align;
 
 	if (WARN_ON(kgsl_memdesc_use_cpu_map(memdesc)))
 		return -EINVAL;
@@ -2134,28 +2224,13 @@ static int kgsl_iommu_get_gpuaddr(struct kgsl_pagetable *pagetable,
 		end = pagetable->va_end;
 	}
 
-	spin_lock(&pagetable->lock);
-
-	addr = _get_unmapped_area(pagetable, start, end, size, align);
-
-	if (addr == (uint64_t) -ENOMEM) {
-		ret = -ENOMEM;
-		goto out;
+	ret = get_gpuaddr(pagetable, memdesc, start, end, size, align);
+	/* if OOM, retry once after flushing lockless_workqueue */
+	if (ret == -ENOMEM) {
+		flush_workqueue(kgsl_driver.lockless_workqueue);
+		ret = get_gpuaddr(pagetable, memdesc, start, end, size, align);
 	}
 
-	/*
-	 * This path is only called in a non-SVM path with locks so we can be
-	 * sure we aren't racing with anybody so we don't need to worry about
-	 * taking the lock
-	 */
-	ret = _insert_gpuaddr(pagetable, addr, size);
-	if (ret == 0) {
-		memdesc->gpuaddr = addr;
-		memdesc->pagetable = pagetable;
-	}
-
-out:
-	spin_unlock(&pagetable->lock);
 	return ret;
 }
 
@@ -2212,6 +2287,7 @@ static int kgsl_iommu_setup_context(struct kgsl_mmu *mmu,
 {
 	struct device_node *node = of_find_node_by_name(parent, name);
 	struct platform_device *pdev;
+	struct kgsl_device *device = KGSL_MMU_DEVICE(mmu);
 	int ret;
 
 	if (!node)
@@ -2226,7 +2302,7 @@ static int kgsl_iommu_setup_context(struct kgsl_mmu *mmu,
 
 	context->cb_num = -1;
 	context->name = name;
-	context->kgsldev = KGSL_MMU_DEVICE(mmu);
+	context->kgsldev = device;
 	context->pdev = pdev;
 	ratelimit_default_init(&context->ratelimit);
 
@@ -2257,7 +2333,7 @@ static int kgsl_iommu_setup_context(struct kgsl_mmu *mmu,
 	if (context->cb_num >= 0)
 		return 0;
 
-	dev_err(KGSL_MMU_DEVICE(mmu)->dev, "Couldn't get the context bank for %s: %d\n",
+	dev_err(&device->pdev->dev, "Couldn't get the context bank for %s: %d\n",
 		context->name, context->cb_num);
 
 	iommu_detach_device(context->domain, &context->pdev->dev);
@@ -2320,7 +2396,7 @@ static int iommu_probe_user_context(struct kgsl_device *device,
 	/* Enable TTBR0 on the default and LPAC contexts */
 	kgsl_iommu_set_ttbr0(&iommu->user_context, mmu, &pt->info.cfg);
 
-	set_smmu_aperture(device, &iommu->user_context);
+	kgsl_set_smmu_aperture(device, &iommu->user_context);
 
 	kgsl_iommu_set_ttbr0(&iommu->lpac_context, mmu, &pt->info.cfg);
 
@@ -2369,7 +2445,7 @@ static int iommu_probe_secure_context(struct kgsl_device *device,
 
 	ret = qcom_iommu_set_secure_vmid(context->domain, secure_vmid);
 	if (ret) {
-		dev_err(device->dev, "Unable to set the secure VMID: %d\n", ret);
+		dev_err(&device->pdev->dev, "Unable to set the secure VMID: %d\n", ret);
 		iommu_domain_free(context->domain);
 		context->domain = NULL;
 
@@ -2445,19 +2521,14 @@ static void kgsl_iommu_check_config(struct kgsl_mmu *mmu,
 	of_node_put(node);
 }
 
-int kgsl_iommu_probe(struct kgsl_device *device)
+int kgsl_iommu_bind(struct kgsl_device *device, struct platform_device *pdev)
 {
 	u32 val[2];
 	int ret, i;
 	struct kgsl_iommu *iommu = KGSL_IOMMU(device);
-	struct platform_device *pdev;
 	struct kgsl_mmu *mmu = &device->mmu;
-	struct device_node *node;
+	struct device_node *node = pdev->dev.of_node;
 	struct kgsl_global_memdesc *md;
-
-	node = of_find_compatible_node(NULL, NULL, "qcom,kgsl-smmu-v2");
-	if (!node)
-		return -ENODEV;
 
 	/* Create a kmem cache for the pagetable address objects */
 	if (!addr_entry_cache) {
@@ -2470,7 +2541,7 @@ int kgsl_iommu_probe(struct kgsl_device *device)
 
 	ret = of_property_read_u32_array(node, "reg", val, 2);
 	if (ret) {
-		dev_err(device->dev,
+		dev_err(&device->pdev->dev,
 			"%pOF: Unable to read KGSL IOMMU register range\n",
 			node);
 		goto err;
@@ -2483,14 +2554,12 @@ int kgsl_iommu_probe(struct kgsl_device *device)
 		goto err;
 	}
 
-	pdev = of_find_device_by_node(node);
 	iommu->pdev = pdev;
 	iommu->num_clks = 0;
 
 	iommu->clks = devm_kcalloc(&pdev->dev, ARRAY_SIZE(kgsl_iommu_clocks),
 				sizeof(*iommu->clks), GFP_KERNEL);
 	if (!iommu->clks) {
-		platform_device_put(pdev);
 		ret = -ENOMEM;
 		goto err;
 	}
@@ -2514,9 +2583,6 @@ int kgsl_iommu_probe(struct kgsl_device *device)
 	mmu->type = KGSL_MMU_TYPE_IOMMU;
 	mmu->mmu_ops = &kgsl_iommu_ops;
 
-	/* Fill out the rest of the devices in the node */
-	of_platform_populate(node, NULL, NULL, &pdev->dev);
-
 	/* Peek at the phandle to set up configuration */
 	kgsl_iommu_check_config(mmu, node);
 
@@ -2524,13 +2590,11 @@ int kgsl_iommu_probe(struct kgsl_device *device)
 	ret = iommu_probe_user_context(device, node);
 	if (ret) {
 		of_platform_depopulate(&pdev->dev);
-		platform_device_put(pdev);
 		goto err;
 	}
 
 	/* Probe the secure pagetable (this is optional) */
 	iommu_probe_secure_context(device, node);
-	of_node_put(node);
 
 	/* Map any globals that might have been created early */
 	list_for_each_entry(md, &device->globals, node) {
@@ -2578,7 +2642,6 @@ err:
 	kmem_cache_destroy(addr_entry_cache);
 	addr_entry_cache = NULL;
 
-	of_node_put(node);
 	return ret;
 }
 
